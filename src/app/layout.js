@@ -17,6 +17,7 @@ export const metadata = {
 export default function RootLayout({ children }) {
   return (
     <html lang="en" suppressHydrationWarning>
+      <head />
       <body className={`${fontSans.variable} ${fontSerif.variable} ${fontMono.variable} min-h-screen bg-background text-foreground`}>
 
         <header className="sticky top-0 z-50 border-b border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">

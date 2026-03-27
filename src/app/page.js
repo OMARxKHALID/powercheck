@@ -59,11 +59,11 @@ export default function DashboardPage() {
         <div>
           <h1 className="text-xl font-semibold tracking-tight">Dashboard</h1>
           <p className="mt-0.5 text-sm text-muted-foreground">
-            Fetch and monitor electricity bills from any Pakistani DISCO
+            Track electricity bills from any Pakistani DISCO
           </p>
         </div>
         <Button size="sm" onClick={() => setModalOpen(true)}>
-          <Plus className="h-4 w-4 mr-1.5" />
+          <Plus className="h-3.5 w-3.5 mr-1.5" />
           Add Meter
         </Button>
       </div>
@@ -89,17 +89,17 @@ export default function DashboardPage() {
 
       {/* Meters grid / empty state */}
       {meters.length === 0 ? (
-        <Card>
-          <CardContent className="flex flex-col items-center justify-center px-6 py-20 text-center">
+        <Card className="border-dashed">
+          <CardContent className="flex flex-col items-center justify-center px-6 py-16 text-center">
             <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-primary/10">
               <Zap className="h-7 w-7 text-primary" />
             </div>
-            <h2 className="mb-2 font-semibold">No meters added yet</h2>
-            <p className="mb-6 max-w-xs text-sm text-muted-foreground">
-              Add your electricity reference number to fetch the latest bill from any Pakistani DISCO.
+            <h2 className="mb-1.5 text-base font-semibold">No meters added yet</h2>
+            <p className="mb-5 max-w-xs text-sm text-muted-foreground">
+              Add your electricity reference number to start tracking bills from any Pakistani DISCO.
             </p>
             <Button size="sm" onClick={() => setModalOpen(true)}>
-              <Plus className="h-4 w-4 mr-1.5" />
+              <Plus className="h-3.5 w-3.5 mr-1.5" />
               Add Your First Meter
             </Button>
           </CardContent>

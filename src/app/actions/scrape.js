@@ -1,18 +1,10 @@
 "use server";
 
 import { DISCOS, detectDisco } from "@/lib/disco";
+import sparticuz from "@sparticuz/chromium";
+import { chromium as playwrightChromium } from "playwright-core";
 
 const PITC_BASE = "https://bill.pitc.com.pk";
-
-// Account type sub-paths to try in order
-const ACCOUNT_TYPES = [
-  "general",
-  "industrial",
-  "agriculture",
-  "commercial",
-  "bulk",
-  "residential",
-];
 
 class FetchError extends Error {
   constructor(message, officialUrl) {
@@ -21,179 +13,190 @@ class FetchError extends Error {
   }
 }
 
+// All PITC-based DISCOs (excluding KE which has its own API)
+const PITC_DISCOS = ["LESCO", "MEPCO", "FESCO", "GEPCO", "IESCO", "PESCO", "HESCO", "SEPCO", "QESCO", "TESCO"];
+
 export async function scrapeBill(reference, disco) {
   const code = disco || detectDisco(reference);
 
-  if (!code) {
-    throw new Error(
-      "Could not identify your DISCO. Please select it manually.",
-    );
+  // If we have a specific DISCO (manual or detected), try it first
+  if (code === "KE") {
+    return scrapeKElectric(reference, DISCOS["KE"]);
   }
 
-  const discoInfo = DISCOS[code];
-  if (!discoInfo) throw new Error(`Unknown DISCO code: ${code}`);
+  if (code && DISCOS[code]?.pitcEndpoint) {
+    try {
+      return await scrapePITC(reference, code, DISCOS[code]);
+    } catch {
+      // Fall through to try all DISCOs
+    }
+  }
 
-  return code === "KE"
-    ? scrapeKElectric(reference, discoInfo)
-    : scrapePITC(reference, code, discoInfo);
+  // Try all PITC DISCOs until we find the bill
+  for (const tryCode of PITC_DISCOS) {
+    try {
+      return await scrapePITC(reference, tryCode, DISCOS[tryCode]);
+    } catch {
+      continue;
+    }
+  }
+
+  throw new FetchError(
+    `No bill found for reference "${reference}" on any DISCO. Please verify the number or check the official portal.`,
+    "https://bill.pitc.com.pk",
+  );
 }
 
 async function scrapePITC(reference, code, discoInfo) {
-  const headers = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    Accept:
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Cache-Control": "no-cache",
-    Pragma: "no-cache",
-    Referer: `${PITC_BASE}/${discoInfo.pitcEndpoint}`,
-  };
+  const endpoint = discoInfo.pitcEndpoint;
+  const baseUrl = `${PITC_BASE}/${endpoint}`;
 
-  // The PITC portal uses GET requests with ?refno= at sub-path routes.
-  // Try each account type sub-path until we get a valid bill response.
-  for (const accountType of ACCOUNT_TYPES) {
-    const url = `${PITC_BASE}/${discoInfo.pitcEndpoint}/${accountType}?refno=${encodeURIComponent(reference)}`;
+  // Local dev: use Helium browser (Chromium-based). Vercel: use @sparticuz/chromium
+  const isVercel = !!process.env.VERCEL;
+  const localBrowserPath = "/home/omar/AppImages/squashfs-root/opt/helium/helium";
+  const executablePath = isVercel
+    ? await sparticuz.executablePath()
+    : localBrowserPath;
 
-    let response;
-    try {
-      response = await fetch(url, {
-        method: "GET",
-        headers,
-        signal: AbortSignal.timeout(15000),
-      });
-    } catch {
-      continue; // network error on this sub-path, try next
+  const browser = await playwrightChromium.launch({
+    headless: true,
+    args: isVercel
+      ? sparticuz.args
+      : ["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu"],
+    executablePath,
+  });
+
+  try {
+    const context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    });
+    const page = await context.newPage();
+
+    // Step 1: Navigate to the DISCO portal
+    await page.goto(baseUrl, { waitUntil: "networkidle", timeout: 30000 });
+
+    // Step 2: Fill in reference and click Search
+    await page.fill('input[name="searchTextBox"]', reference);
+    await page.click('input[name="btnSearch"]');
+
+    // Step 3: Wait for the bill page to load (redirect + loading animation)
+    await page.waitForLoadState("networkidle", { timeout: 30000 });
+    await page.waitForTimeout(5000);
+
+    // Step 4: Extract the full page text
+    const bodyText = await page.evaluate(() => document.body.innerText);
+
+    if (!bodyText || bodyText.length < 100) {
+      throw new FetchError(
+        `No bill found for reference "${reference}" on ${discoInfo.name}. Please verify the number or check the official portal.`,
+        discoInfo.officialUrl,
+      );
     }
 
-    if (!response.ok) continue;
-
-    const html = await response.text();
-
-    // Skip clearly empty or error pages
-    if (isEmptyResponse(html)) continue;
-
-    // Got a valid HTML page with bill data
-    const bill = parsePITCHtml(html, code, discoInfo, reference);
-
-    if (bill.billing.currentAmount > 0 || bill.consumption.currentUnits > 0) {
-      return bill;
-    }
+    return parseBillText(bodyText, code, discoInfo, reference);
+  } catch (e) {
+    if (e instanceof FetchError) throw e;
+    throw new FetchError(
+      `Failed to fetch bill: ${e.message}. Please check the official portal.`,
+      discoInfo.officialUrl,
+    );
+  } finally {
+    await browser.close();
   }
-
-  // All sub-paths failed — throw with official portal link
-  throw new FetchError(
-    `No bill found for reference "${reference}" on ${discoInfo.name}. Please verify the number or check the official portal.`,
-    discoInfo.officialUrl,
-  );
 }
 
-function isEmptyResponse(html) {
-  if (!html || html.trim().length < 200) return true;
-  const lower = html.toLowerCase();
-  return (
-    lower.includes("no record found") ||
-    lower.includes("invalid reference") ||
-    lower.includes("record not found") ||
-    lower.includes("not found") ||
-    lower.includes("error occurred")
+function parseBillText(text, code, discoInfo, reference) {
+  const clean = (s) => s?.replace(/\s+/g, " ").trim() || "";
+
+  // ── Consumer Name & Address ──────────────────────────────────────────────
+  let consumerName = "N/A";
+  let address = "N/A";
+
+  const nameMatch = text.match(/NAME\s*&\s*ADDRESS\s*\n([^\n]+)/i);
+  if (nameMatch) {
+    consumerName = clean(nameMatch[1]);
+    const nameIdx = text.indexOf(nameMatch[0]);
+    const afterName = text.slice(nameIdx + nameMatch[0].length, nameIdx + 200);
+    const addressLines = afterName
+      .split("\n")
+      .slice(0, 4)
+      .map(clean)
+      .filter((l) => l && !l.match(/^(Say No|آپکے)/i));
+    if (addressLines.length > 0) {
+      address = addressLines.join(", ");
+    }
+  }
+
+  // ── Bill Month ──────────────────────────────────────────────────────────
+  let month = new Date().toLocaleDateString("en-US", {
+    month: "long",
+    year: "numeric",
+  });
+  const monthMatch = text.match(
+    /BILL MONTH\s*.*?\n\s*([A-Z]{3}\s*\d{2})/i,
   );
-}
+  if (monthMatch) month = clean(monthMatch[1]);
 
-function parsePITCHtml(html, code, discoInfo, reference) {
-  function text(patterns) {
-    for (const re of patterns) {
-      const m = html.match(re);
-      if (m?.[1]) return m[1].trim().replace(/\s+/g, " ");
-    }
-    return "";
+  // ── Due Date ────────────────────────────────────────────────────────────
+  let dueDate = nextMonthDate(15);
+  const dueDateMatch = text.match(
+    /DUE DATE\s*.*?\n\s*(\d{2}\s+[A-Z]{3}\s+\d{2})/i,
+  );
+  if (dueDateMatch) dueDate = normalizeDate(clean(dueDateMatch[1]));
+
+  // ── Current Units ───────────────────────────────────────────────────────
+  let currentUnits = 0;
+  const unitsMatch = text.match(/UNITS\s+(\d+)/i);
+  if (unitsMatch) currentUnits = parseInt(unitsMatch[1], 10);
+
+  if (currentUnits === 0) {
+    const unitsAlt = text.match(
+      /PRESENT READING\s*\n[^\n]*\n[^\n]*\n\s*(\d+)/i,
+    );
+    if (unitsAlt) currentUnits = parseInt(unitsAlt[1], 10);
   }
 
-  function amount(patterns) {
-    for (const re of patterns) {
-      const m = html.match(re);
-      if (m?.[1]) {
-        const n = parseFloat(m[1].replace(/,/g, "").replace(/[^\d.]/g, ""));
-        if (!isNaN(n) && n > 0) return n;
-      }
-    }
-    return 0;
+  // ── Previous Units ─────────────────────────────────────────────────────
+  let previousUnits = 0;
+  const prevMatch = text.match(
+    /PREVIOUS READING\s*\n[^\n]*\n\s*(\d+)/i,
+  );
+  if (prevMatch) previousUnits = parseInt(prevMatch[1], 10);
+
+  // ── Payable Within Due Date ──────────────────────────────────────────────
+  let withinDue = 0;
+  const withinDueMatch = text.match(
+    /PAYABLE WITHIN DUE DATE\s*\n?\s*(\d[\d,]*)/i,
+  );
+  if (withinDueMatch) {
+    withinDue = parseFloat(withinDueMatch[1].replace(/,/g, "")) || 0;
   }
 
-  function integer(patterns) {
-    for (const re of patterns) {
-      const m = html.match(re);
-      if (m?.[1]) {
-        const n = parseInt(m[1].replace(/,/g, ""), 10);
-        if (!isNaN(n)) return n;
-      }
-    }
-    return 0;
+  // ── Payable After Due Date ──────────────────────────────────────────────
+  let afterDue = 0;
+  const afterDueMatch = text.match(
+    /PAYABLE AFTER DUE DATE\s*\n?\s*(\d[\d,]*)/i,
+  );
+  if (afterDueMatch) {
+    afterDue = parseFloat(afterDueMatch[1].replace(/,/g, "")) || 0;
+  }
+  if (afterDue === 0 && withinDue > 0) {
+    afterDue = Math.round(withinDue * 1.04);
   }
 
-  const consumerName = text([
-    /Consumer\s*Name[^>]*>[^<]*<[^>]*>([^<]+)/i,
-    /Name\s*:?\s*<\/td>\s*<td[^>]*>([^<]+)/i,
-    /<td[^>]*>Consumer Name<\/td>\s*<td[^>]*>([^<]+)/i,
-  ]);
+  // ── Current Amount ──────────────────────────────────────────────────────
+  const currentAmount = withinDue;
 
-  const address = text([
-    /Address[^>]*>[^<]*<[^>]*>([^<]+)/i,
-    /Address\s*:?\s*<\/td>\s*<td[^>]*>([^<]+)/i,
-  ]);
+  // ── Consumer ID ─────────────────────────────────────────────────────────
+  let consumerId = "";
+  const consumerIdMatch = text.match(/CONSUMER ID\s*\n\s*(\d+)/i);
+  if (consumerIdMatch) consumerId = consumerIdMatch[1];
 
-  const month =
-    text([
-      /Bill\s*(?:Month|Period)[^>]*>[^<]*<[^>]*>([^<]+)/i,
-      /(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[^<,\d]*\d{4}/i,
-    ]) ||
-    new Date().toLocaleDateString("en-US", { month: "long", year: "numeric" });
+  // ── Status ─────────────────────────────────────────────────────────────
+  const isPaid = /\bPAID\b/i.test(text);
 
-  const withinDue = amount([
-    /Payable\s*(?:Within|Before)\s*Due\s*Date[^>]*>[^<]*<[^>]*>([\d,]+(?:\.\d{2})?)/i,
-    /Within\s*Due\s*Date[^>]*>[^<]*<[^>]*>([\d,]+(?:\.\d{2})?)/i,
-    /Net\s*Payable[^>]*>[^<]*<[^>]*>([\d,]+(?:\.\d{2})?)/i,
-    /Amount\s*Payable[^>]*>[^<]*<[^>]*>([\d,]+(?:\.\d{2})?)/i,
-    /(?:Rs\.?|PKR)\s*([\d,]+(?:\.\d{2})?)/i,
-  ]);
-
-  const afterDue =
-    amount([
-      /Payable\s*After\s*Due\s*Date[^>]*>[^<]*<[^>]*>([\d,]+(?:\.\d{2})?)/i,
-      /After\s*Due\s*Date[^>]*>[^<]*<[^>]*>([\d,]+(?:\.\d{2})?)/i,
-    ]) || Math.round(withinDue * 1.1);
-
-  const rawDue = text([
-    /Due\s*Date[^>]*>[^<]*<[^>]*>(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i,
-    /Last\s*Date[^>]*>[^<]*<[^>]*>(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i,
-    /Due\s*Date\s*:?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i,
-  ]);
-
-  const dueDate = rawDue ? normalizeDate(rawDue) : nextMonthDate(15);
-
-  const currentUnits = integer([
-    /Current\s*(?:Units|Reading)[^>]*>[^<]*<[^>]*>([\d,]+)/i,
-    /Units\s*Consumed[^>]*>[^<]*<[^>]*>([\d,]+)/i,
-    /Present\s*(?:Reading|Units)[^>]*>[^<]*<[^>]*>([\d,]+)/i,
-  ]);
-
-  const previousUnits = integer([
-    /Previous\s*(?:Units|Reading)[^>]*>[^<]*<[^>]*>([\d,]+)/i,
-    /Last\s*(?:Reading|Units)[^>]*>[^<]*<[^>]*>([\d,]+)/i,
-  ]);
-
-  const statusMatch = html.match(/Status[^>]*>[^<]*<[^>]*>([^<]*)/i);
-  const isPaid = statusMatch
-    ? /\bpaid\b/i.test(statusMatch[1]) && !/unpaid/i.test(statusMatch[1])
-    : false;
-
-  const pdfMatch = html.match(/href="([^"]+\.pdf[^"]*)"/i);
-  const pdfUrl = pdfMatch
-    ? pdfMatch[1].startsWith("http")
-      ? pdfMatch[1]
-      : `${PITC_BASE}/${pdfMatch[1]}`
-    : null;
-
+  // ── Consumption diff ────────────────────────────────────────────────────
   const diffPercent =
     previousUnits > 0
       ? Math.round(((currentUnits - previousUnits) / previousUnits) * 1000) / 10
@@ -205,37 +208,41 @@ function parsePITCHtml(html, code, discoInfo, reference) {
     meta: {
       disco: code,
       discoName: discoInfo.name,
-      consumerName: consumerName || "N/A",
-      address: address || "N/A",
+      consumerName,
+      address,
       referenceNo: reference,
+      consumerId,
     },
     billing: {
       month,
-      currentAmount: withinDue,
+      currentAmount,
       payableWithinDue: withinDue,
       payableAfterDue: afterDue,
       dueDate,
       status: determineStatus(dueDate, isPaid),
     },
     consumption: { currentUnits, previousUnits, diffPercent },
-    pdfUrl,
+    pdfUrl: null,
   };
 }
 
 async function scrapeKElectric(reference, discoInfo) {
   let response;
   try {
-    response = await fetch("https://www.ke.com.pk/api/customer/bill-inquiry", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    response = await fetch(
+      "https://www.ke.com.pk/api/customer/bill-inquiry",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        },
+        body: JSON.stringify({ accountNumber: reference }),
+        signal: AbortSignal.timeout(15000),
       },
-      body: JSON.stringify({ accountNumber: reference }),
-      signal: AbortSignal.timeout(15000),
-    });
+    );
   } catch {
     throw new FetchError(
       "Could not reach K-Electric. Please check the official portal.",
@@ -285,12 +292,16 @@ async function scrapeKElectric(reference, discoInfo) {
       payableAfterDue: data.amountAfterDue
         ? parseFloat(data.amountAfterDue)
         : Math.round(currentAmount * 1.1),
-      dueDate: data.dueDate ? normalizeDate(data.dueDate) : nextMonthDate(15),
+      dueDate: data.dueDate
+        ? normalizeDate(data.dueDate)
+        : nextMonthDate(15),
       status: determineStatus(data.dueDate ?? "", data.isPaid ?? false),
     },
     consumption: {
       currentUnits,
-      previousUnits: data.previousUnits ? parseInt(data.previousUnits, 10) : 0,
+      previousUnits: data.previousUnits
+        ? parseInt(data.previousUnits, 10)
+        : 0,
       diffPercent: 0,
     },
     pdfUrl: data.billUrl ?? null,
